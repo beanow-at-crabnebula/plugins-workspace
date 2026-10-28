@@ -3,12 +3,13 @@
 // SPDX-License-Identifier: MIT
 
 #[cfg(feature = "cache")]
+mod storage;
+
+#[cfg(feature = "cache")]
 use std::time::Duration;
 
 #[cfg(feature = "cache")]
-use http_cache_reqwest::{
-    Cache, CacheOptions, HttpCache, HttpCacheOptions, MokaCache, MokaManager,
-};
+use http_cache_reqwest::{Cache, CacheOptions, HttpCache, HttpCacheOptions};
 use serde::{Deserialize, Serialize};
 
 /// Represents a caching behavior for update checks.
@@ -81,14 +82,14 @@ pub struct CacheConfig {
 #[cfg(feature = "cache")]
 const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 
-/// The cache capacity per created MokaManager instance.
+/// The cache capacity per created [`CacheManager`] instance.
 /// Generally this would be allocated once for application-wide use.
 ///
 /// Assumes 1-3 endpoints might typically be used.
 /// Assumes redirects don't take up a slot.
 /// Leaves some overhead for changing inputs.
 #[cfg(feature = "cache")]
-const CACHE_CAPACITY: u64 = 6;
+const CACHE_CAPACITY: usize = 6;
 
 /// A cache manager for the updater.
 ///
@@ -99,7 +100,7 @@ const CACHE_CAPACITY: u64 = 6;
 #[derive(Debug, Clone)]
 pub struct CacheManager {
     #[cfg(feature = "cache")]
-    http_cache: MokaManager,
+    http_cache: storage::MemoryStorage,
 
     // Supplied as-is to `HttpCacheOptions`.
     // None means no limit and it will cache however long the server suggests.
@@ -125,7 +126,7 @@ impl CacheManager {
 
         #[cfg(feature = "cache")]
         Self {
-            http_cache: MokaManager::new(MokaCache::new(CACHE_CAPACITY)),
+            http_cache: Default::default(),
             max_ttl: config
                 .max_ttl_mins
                 .or(Some(12 * 60))
@@ -161,7 +162,7 @@ impl CacheManager {
 
     /// Provides a caching middleware for use with `reqwest-middleware`.
     #[cfg(feature = "cache")]
-    fn middleware(&self, mode_override: Option<CacheMode>) -> Cache<MokaManager> {
+    fn middleware(&self, mode_override: Option<CacheMode>) -> Cache<storage::MemoryStorage> {
         Cache(HttpCache {
             mode: mode_override.unwrap_or(self.default_mode).into(),
             manager: self.http_cache.clone(),
@@ -478,6 +479,40 @@ mod tests {
             get(&cache, None, &server.url(), &[]).await;
             get(&cache.clone(), None, &server.url(), &[]).await;
             mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn evicts_least_recently_used_when_full() {
+            let cache = enabled_pending_default();
+            let mut server = Server::new_async().await;
+            // One more path than fits, path 1 is the least recently used once path 0 is read again.
+            let mut mocks = Vec::new();
+            for (path, expected_hits) in [(0, 1), (1, 2)]
+                .into_iter()
+                .chain((2..=CACHE_CAPACITY).map(|path| (path, 1)))
+            {
+                let mock = server
+                    .mock("GET", format!("/{path}").as_str())
+                    .with_header("cache-control", "max-age=60")
+                    .expect(expected_hits)
+                    .create_async()
+                    .await;
+                mocks.push(mock);
+            }
+            let url = |path: usize| format!("{}/{path}", server.url());
+
+            for path in 0..CACHE_CAPACITY {
+                get(&cache, None, &url(path), &[]).await;
+            }
+            get(&cache, None, &url(0), &[]).await;
+            get(&cache, None, &url(CACHE_CAPACITY), &[]).await;
+
+            // Path 0 survived, path 1 was evicted.
+            get(&cache, None, &url(0), &[]).await;
+            get(&cache, None, &url(1), &[]).await;
+            for mock in mocks {
+                mock.assert_async().await;
+            }
         }
 
         #[tokio::test]

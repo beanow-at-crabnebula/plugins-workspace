@@ -91,6 +91,14 @@ const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 #[cfg(feature = "cache")]
 const CACHE_CAPACITY: usize = 6;
 
+/// The largest response body the cache stores, larger responses are not cached.
+///
+/// A sanity cap, not a tuning knob: update manifests are far smaller, even with long release
+/// notes or large signatures. It stops an unexpectedly huge response, such as a misconfigured
+/// endpoint serving a file, from being held in memory.
+#[cfg(feature = "cache")]
+const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+
 /// A cache manager for the updater.
 ///
 /// Uses an internal `Arc` so cloning means we use a shared cache.
@@ -513,6 +521,53 @@ mod tests {
             for mock in mocks {
                 mock.assert_async().await;
             }
+        }
+
+        #[tokio::test]
+        async fn does_not_store_bodies_over_max_size() {
+            let cache = enabled_pending_default();
+            let mut server = Server::new_async().await;
+            let mock = server
+                .mock("GET", "/")
+                .with_header("cache-control", "max-age=60")
+                .with_body(vec![b'x'; MAX_BODY_SIZE + 1])
+                .expect(2)
+                .create_async()
+                .await;
+
+            get(&cache, None, &server.url(), &[]).await;
+            get(&cache, None, &server.url(), &[]).await;
+            mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn body_over_max_size_drops_the_older_response() {
+            let cache = enabled_pending_default();
+            let mut server = Server::new_async().await;
+            let small = server
+                .mock("GET", "/")
+                .with_header("cache-control", "max-age=60")
+                .with_body("small")
+                .expect(1)
+                .create_async()
+                .await;
+            get(&cache, None, &server.url(), &[]).await;
+            small.assert_async().await;
+            small.remove_async().await;
+
+            let large = server
+                .mock("GET", "/")
+                .with_header("cache-control", "max-age=60")
+                .with_body(vec![b'x'; MAX_BODY_SIZE + 1])
+                .expect(2)
+                .create_async()
+                .await;
+            get(&cache, Some(CacheMode::CheckNow), &server.url(), &[]).await;
+
+            // The small response isn't served in place of the newer large one.
+            let (_, body) = get(&cache, None, &server.url(), &[]).await;
+            assert_eq!(body.len(), MAX_BODY_SIZE + 1);
+            large.assert_async().await;
         }
 
         #[tokio::test]

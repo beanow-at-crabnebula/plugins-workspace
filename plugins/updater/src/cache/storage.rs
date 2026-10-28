@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use http_cache::{CacheManager, HttpResponse, Result};
 use http_cache_semantics::CachePolicy;
 
-use super::CACHE_CAPACITY;
+use super::{CACHE_CAPACITY, MAX_BODY_SIZE};
 
 /// In-memory storage for the HTTP cache, keeping the [`CACHE_CAPACITY`] most recently used entries.
+/// Responses with a body over [`MAX_BODY_SIZE`] are not stored.
 ///
 /// Entries are stored as-is, without serializing them.
 /// Freshness isn't checked here: `http-cache` validates the stored [`CachePolicy`] on every read.
@@ -59,7 +60,13 @@ impl CacheManager for MemoryStorage {
         policy: CachePolicy,
     ) -> Result<HttpResponse> {
         let mut entries = self.entries();
+        // Also when not storing this response, so an older one isn't served in its place.
         entries.retain(|entry| entry.key != cache_key);
+        if response.body.len() > MAX_BODY_SIZE {
+            // Declining to store is fine, `http-cache` uses the returned response
+            // and the next lookup is a cache miss.
+            return Ok(response);
+        }
         if entries.len() >= CACHE_CAPACITY {
             // Evict the least recently used.
             entries.remove(0);
